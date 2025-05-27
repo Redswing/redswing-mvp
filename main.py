@@ -90,59 +90,55 @@ async def web_signup(request: Request):
         return PlainTextResponse("Something went wrong", status_code=400)
 
 @app.post("/sms")
-async def receive_message(request: Request):
-    form = await request.form()
-    message_body = form.get("Body")
-    from_number = form.get("From")
+    async def receive_message(request: Request):
+        form = await request.form()
+        message_body = form.get("Body").strip().lower()
+        from_number = form.get("From")
 
-    try:
-        # Check/create user
+        # Check or create user
         user_res = supabase.table("users").select("id").eq("phone", from_number).execute()
         if user_res.data:
             user_id = user_res.data[0]["id"]
         else:
             new_user = supabase.table("users").insert({"phone": from_number}).execute()
             user_id = new_user.data[0]["id"]
+
             twilio_client.messages.create(
-                body=(
-                    "👋 Welcome to Redswing! Just send me your match result anytime — "
-                    "like 'Shot 85 at Pinehurst' or 'Won 6-3, 6-4 in tennis'.\n\n"
-                    "Text 'help' if you want to see what I can do."
-                ),
+                body="👋 Welcome to Redswing! Just text a result like 'Shot 88 at Pinehurst' to get started. Text 'help' for commands.",
                 from_=twilio_whatsapp_number,
                 to=from_number
             )
             return "OK"
 
-        # Parse and handle message
-        parsed = parse_message(message_body)
-        intent = parsed.get("intent")
-        response_text = parsed.get("response", "Got it!")
-
-        if intent == "get_help":
+        # ✅ Manual intent override
+        if message_body in ["help", "commands", "what can you do"]:
             response_text = (
                 "🛠 Here’s what you can do with Redswing:\n\n"
-                "• Log a match — just text a result like:\n"
+                "• Log a match — just text your result:\n"
                 "  'Shot 88 at Pinehurst' or 'Beat Sam 6-4, 6-3 in tennis'\n\n"
-                "• See trends — text 'summary'\n"
-                "• Get help — text 'help' anytime\n\n"
+                "• Get your stats — text 'summary'\n"
+                "• Ask for help — text 'help' anytime\n\n"
                 "📌 No app needed. Just play and text me."
             )
-        elif intent == "get_summary":
+        elif message_body == "summary":
             response_text = get_summary(user_id)
+        else:
+            # Use GPT to parse the message
+            parsed = parse_message(message_body)
+            response_text = parsed.get("response", "Got it!")
 
-        # Log the message
-        supabase.table("sessions").insert({
-            "user_id": user_id,
-            "sport": parsed.get("sport"),
-            "opponent": parsed.get("opponent"),
-            "score": parsed.get("score"),
-            "outcome": parsed.get("outcome"),
-            "raw_message": message_body,
-            "parsed_json": parsed
-        }).execute()
+            # Log the session
+            supabase.table("sessions").insert({
+                "user_id": user_id,
+                "sport": parsed.get("sport"),
+                "opponent": parsed.get("opponent"),
+                "score": parsed.get("score"),
+                "outcome": parsed.get("outcome"),
+                "raw_message": message_body,
+                "parsed_json": parsed
+            }).execute()
 
-        # Send reply
+        # Send the response
         twilio_client.messages.create(
             body=response_text,
             from_=twilio_whatsapp_number,
