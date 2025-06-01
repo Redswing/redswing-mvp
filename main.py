@@ -20,7 +20,7 @@ twilio_whatsapp_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
 # CORS for Webflow
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Can be tightened to your Webflow domain later
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,7 +55,6 @@ async def web_signup(request: Request):
     try:
         user_res = supabase.table("users").select("id").eq("phone", whatsapp_phone).execute()
         if user_res.data:
-            # Already exists — send confirmation message
             twilio_client.messages.create(
                 body=(
                     "👋 You're already signed up for Redswing!\n\n"
@@ -67,7 +66,6 @@ async def web_signup(request: Request):
             )
             return PlainTextResponse("User already exists", status_code=200)
 
-        # Create user and send welcome message
         supabase.table("users").insert({"phone": whatsapp_phone}).execute()
 
         twilio_client.messages.create(
@@ -92,10 +90,16 @@ async def web_signup(request: Request):
 @app.post("/sms")
 async def receive_message(request: Request):
     form = await request.form()
-    message_body = form.get("Body").strip().lower()
+    message_body = form.get("Body").strip()
     from_number = form.get("From")
 
-    # Check or create user
+    # Log inbound message
+    supabase.table("messages").insert({
+        "phone": from_number,
+        "body": message_body,
+        "direction": "inbound"
+    }).execute()
+
     user_res = supabase.table("users").select("id").eq("phone", from_number).execute()
     if user_res.data:
         user_id = user_res.data[0]["id"]
@@ -110,24 +114,25 @@ async def receive_message(request: Request):
         )
         return "OK"
 
-    # ✅ Manual intent override
-    if message_body in ["help", "commands", "what can you do"]:
+    parsed = parse_message(message_body)
+    intent = parsed.get("intent")
+    response_text = parsed.get("response", "✅ Got it!")
+
+    if intent == "get_help":
         response_text = (
             "🛠 Here’s what you can do with Redswing:\n\n"
             "• Log a match — just text your result:\n"
             "  'Shot 88 at Pinehurst' or 'Beat Sam 6-4, 6-3 in tennis'\n\n"
+            "• Track stats — text things like:\n"
+            "  'Had 32 putts today' or 'missed mostly forehands'\n\n"
             "• Get your stats — text 'summary'\n"
-            "• Ask for help — text 'help' anytime\n\n"
-            "📌 No app needed. Just play and text me."
+            "• Ask for help — text 'help' anytime"
         )
-    elif message_body == "summary":
-        response_text = get_summary(user_id)
-    else:
-        # Use GPT to parse the message
-        parsed = parse_message(message_body)
-        response_text = parsed.get("response", "Got it!")
 
-        # Log the session
+    elif intent == "get_summary":
+        response_text = get_summary(user_id)
+
+    elif intent == "log_match":
         supabase.table("sessions").insert({
             "user_id": user_id,
             "sport": parsed.get("sport"),
@@ -138,12 +143,31 @@ async def receive_message(request: Request):
             "parsed_json": parsed
         }).execute()
 
-    # Send the response
+    elif intent == "log_stat":
+        supabase.table("performance_stats").insert({
+            "user_id": user_id,
+            "sport": parsed.get("sport"),
+            "stat_type": parsed.get("stat_type"),
+            "stat_value": parsed.get("stat_value"),
+            "context": parsed.get("context", ""),
+            "notes": parsed.get("notes", ""),
+            "raw_message": message_body,
+            "parsed_json": parsed
+        }).execute()
+
+    # Send outbound message
     twilio_client.messages.create(
         body=response_text,
         from_=twilio_whatsapp_number,
         to=from_number
     )
 
-    return "OK"
+    # Log outbound message
+    supabase.table("messages").insert({
+        "phone": from_number,
+        "body": response_text,
+        "direction": "outbound",
+        "user_id": user_id
+    }).execute()
 
+    return "OK"
